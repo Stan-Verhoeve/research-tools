@@ -11,11 +11,11 @@ Load and visualize MCMC chains from [Cobaya](https://cobaya.readthedocs.io) runs
 **Dependencies:** `getdist`, `matplotlib`, `numpy`
 
 ```bash
-# Compare two chains, plot modified gravity parameters
-python plot_chain.py -b /path/to/chains -c ODE_P18 ODE_P18+FS+BAO -l "PR4" "PR4+FS+BAO" -p alphaB alphaM
+# Compare two chains, plotting a subset of parameters
+python plot_chain.py -b /path/to/chains -c chain1 chain2 -l "label1" "label2" -p param1 param2
 
-# Full parameter projection plot
-python plot_chain.py -b /path/to/chains -c ODE_P18 ODE_P18+FS+BAO --projection
+# Projection plot across all default parameters
+python plot_chain.py -b /path/to/chains -c chain1 chain2 --projection
 
 python plot_chain.py --help  # full list of options
 ```
