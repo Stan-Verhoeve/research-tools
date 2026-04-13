@@ -7,6 +7,7 @@ triangle plots comparing different cosmological model runs.
 """
 # pyright: reportUnusedCallResult=false
 import argparse
+import json
 import logging
 import sys
 import matplotlib.pyplot as plt
@@ -100,6 +101,52 @@ PLANCK_PARAMS: Final[dict[str, float]] = {
 }
 
 
+def load_json_file(path: str) -> dict:
+    """
+    Load a JSON file and return its contents as a dict.
+
+    Args:
+        path: Path to the JSON file
+
+    Returns:
+        Dictionary with the file contents
+
+    Raises:
+        FileNotFoundError: If the file does not exist
+        ValueError: If the file is not valid JSON or not an object
+    """
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    with p.open() as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a JSON object in {path}, got {type(data).__name__}")
+    return data
+
+
+def resolve_reference_renames(
+    reference: dict[str, float],
+    rename_map: dict[str, str]
+) -> dict[str, float]:
+    """
+    Translate reference dict keys from old parameter names to new ones.
+
+    Since apply_parameter_renames commits renames directly into param.name,
+    GetDist's marker lookup (which uses param.name) expects the new names.
+    Both old names (e.g. from PLANCK_PARAMS) and new names pass through
+    correctly: old names are translated, new names are left unchanged.
+
+    Args:
+        reference: Dictionary of reference parameter values
+        rename_map: Dictionary mapping old parameter names to new names
+
+    Returns:
+        New dictionary with renamed keys
+    """
+    return {rename_map.get(key, key): value for key, value in reference.items()}
+
+
 @dataclass
 class PlotConfig:
     """Configuration for plot generation."""
@@ -114,12 +161,13 @@ class PlotConfig:
     axes_labelsize: int = DEFAULTS.AXES_LABELSIZE
     title: str | None = None
     projection_plot: bool = False
-    
+    output_format: str = "png"
+
     def __post_init__(self):
         if self.params_to_plot is None:
-            object.__setattr__(self, 'params_to_plot', DEFAULTS.PARAMS_TO_PLOT)
+            self.params_to_plot = DEFAULTS.PARAMS_TO_PLOT
         if self.chain_labels is None:
-            object.__setattr__(self, 'chain_labels', self.chain_names)
+            self.chain_labels = list(self.chain_names)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -195,7 +243,50 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Create projection plot instead of triangle plot"
     )
-    
+    parser.add_argument(
+        "--rename",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Path to JSON file with parameter rename map (merged with and overriding built-in renames)"
+    )
+    parser.add_argument(
+        "--reference",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Path to JSON file with reference/baseline values for markers (merged with and overriding built-in Planck values; may use renamed parameter names)"
+    )
+    parser.add_argument(
+        "--latex-labels",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Path to JSON file with LaTeX labels for parameters (merged with and overriding built-in labels)"
+    )
+    parser.add_argument(
+        "--no-reference",
+        action="store_true",
+        help="Suppress all reference markers (including built-in Planck values)"
+    )
+    parser.add_argument(
+        "-L", "--list-params",
+        action="store_true",
+        help="Print available parameter names after loading and exit"
+    )
+    parser.add_argument(
+        "-f", "--format",
+        type=str,
+        default="png",
+        choices=["png", "pdf", "svg", "eps"],
+        help="Output figure format (default: png)"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable debug logging"
+    )
+
     return parser.parse_args()
 
 
@@ -304,35 +395,38 @@ def apply_parameter_renames(
     rename_map: dict[str, str]
 ) -> None:
     """
-    Apply parameter name aliases to chain.
-    
+    Commit parameter renames directly into param.name and rebuild the index.
+
+    Unlike updateRenames (which only adds aliases into par.renames), this
+    overwrites par.name with the new name so that GetDist's canonical name
+    — used for marker lookup, density caching, and statistics — is the
+    renamed one. The name→column index is rebuilt afterwards.
+
     Args:
         chain: MCSamples object to modify
         rename_map: Dictionary mapping old parameter names to new names
     """
-    chain.updateRenames(rename_map)
+    for par in chain.paramNames.names:
+        if par.name in rename_map:
+            par.name = rename_map[par.name]
+    # Rebuild the name→column index to reflect the new canonical names
+    chain.index = {par.name: i for i, par in enumerate(chain.paramNames.names)}
 
 
 def update_latex_labels(
     chain: MCSamples,
-    rename_map: dict[str, str],
     latex_labels: dict[str, str]
 ) -> None:
     """
     Update LaTeX labels for parameters.
-    
+
+    Since apply_parameter_renames commits renames into par.name, labels can
+    be looked up directly by the (possibly renamed) parameter name.
+
     Args:
         chain: MCSamples object to modify
-        rename_map: Dictionary of parameter renames
         latex_labels: Dictionary mapping parameter names to LaTeX labels
     """
-    # Update labels for renamed parameters
-    for old_name, new_name in rename_map.items():
-        param = chain.paramNames.parWithName(old_name)
-        if param and new_name in latex_labels:
-            param.label = latex_labels[new_name]
-    
-    # Update labels for direct parameter specifications
     for parname, label in latex_labels.items():
         param = chain.paramNames.parWithName(parname)
         if param:
@@ -346,7 +440,7 @@ def process_chain(
 ) -> None:
     """
     Apply renaming and add derived parameters to chain.
-    
+
     Args:
         chain: MCSamples object to process
         rename_map: Dictionary mapping old parameter names to new names
@@ -354,7 +448,7 @@ def process_chain(
     """
     add_derived_braiding_param(chain)
     apply_parameter_renames(chain, rename_map)
-    update_latex_labels(chain, rename_map, latex_labels)
+    update_latex_labels(chain, latex_labels)
 
 
 def build_parameter_suggestions(
@@ -387,43 +481,44 @@ def validate_parameters(
     params: Sequence[str] | None
 ) -> Sequence[str] | None:
     """
-    Validate that requested parameters exist in the chains.
-    
+    Validate that requested parameters exist in all chains.
+
     Args:
-        chains: List of MCSamples to check
-        params: List of parameter names to validate (or None for all)
-        
-    Returns:
-        Validated parameter list or None
-        
+        chains: chains to check
+        params: parameter names to validate (None means all)
+
     Raises:
-        ValueError: If any requested parameter doesn't exist in the chains
+        ValueError: if any parameter is missing from any chain
     """
     if params is None:
         return None
-    
-    param_names = chains[0].getParamNames()
-    missing_params = [p for p in params if param_names.parWithName(p) is None]
-    
-    if not missing_params:
+
+    chain_missing: dict[str, list[str]] = {}
+    for chain in chains:
+        param_names = chain.getParamNames()
+        missing = [p for p in params if param_names.parWithName(p) is None]
+        if missing:
+            chain_missing[chain.label] = missing
+
+    if not chain_missing:
         return params
-    
-    # Build error message with suggestions
-    available_params = set(param_names.list())
-    suggestions = build_parameter_suggestions(missing_params, available_params)
-    
-    error_parts = [
-        f"Parameters not found: {', '.join(missing_params)}",
-        f"\nAvailable: {', '.join(sorted(available_params))}"
-    ]
-    
+
+    all_missing = sorted({p for missing in chain_missing.values() for p in missing})
+    available_params = set(chains[0].getParamNames().list())
+    suggestions = build_parameter_suggestions(all_missing, available_params)
+
+    error_parts = ["Parameters not found:"]
+    for label, missing in chain_missing.items():
+        error_parts.append(f"  {label}: {', '.join(missing)}")
+    error_parts.append(f"\nAvailable: {', '.join(sorted(available_params))}")
+
     if suggestions:
         error_parts.append("\nSuggestions:")
         error_parts.extend(
-            f"  {missing} -> {', '.join(similar)}" 
-            for missing, similar in suggestions.items()
+            f"  {p}: {', '.join(similar)}"
+            for p, similar in suggestions.items()
         )
-    
+
     raise ValueError('\n'.join(error_parts))
 
 
@@ -481,19 +576,19 @@ def create_projection_plot(
     settings: plots.GetDistPlotSettings,
     save_path: Path,
     dpi: int,
-    title: str | None = None
+    title: str | None = None,
 ) -> None:
     """
-    Create and save projection plot showing parameter constraints.
-    
+    Create and save a projection plot of parameter constraints.
+
     Args:
-        chains: List of MCSamples to plot
-        params: List of parameter names to include (or None for all)
-        markers: Dictionary of marker positions for reference values
-        settings: Plot settings object
-        save_path: Path where to save the figure
-        dpi: Resolution for saved figure
-        title: Optional title for the plot
+        chains: chains to plot
+        params: parameters to include (None for all)
+        markers: reference marker values keyed by parameter name
+        settings: plot settings
+        save_path: output path
+        dpi: figure resolution
+        title: optional figure title
     """
     try:
         # Get parameter list
@@ -539,29 +634,17 @@ def create_projection_plot(
             # Get statistics for each parameter
             param_stats = {}
             for param in params:
-                # logger.warning(param)
-                # Use parWithName which handles renames
                 param_obj = chain.paramNames.parWithName(param)
                 if param_obj is not None:
-                    # param_index = chain.paramNames.numberOfName(param)
-                    orig_name = chain.paramNames.parWithName(param).name
-                    param_index = chain.index[orig_name]
+                    param_index = chain.index[param_obj.name]
                     samples = chain.samples[:, param_index]
-                    weights = chain.weights
-                    mean = np.average(samples, weights=weights)
-
-                    stats = chain.getMargeStats().parWithName(orig_name)
-                    lower = stats.limits[1].lower
-                    upper = stats.limits[1].upper
-                    # logger.warning(map_samples[param_index])
-                    # TODO: double-check if mean is correct here
+                    mean = np.average(samples, weights=chain.weights)
+                    marge_stats = chain.getMargeStats().parWithName(param_obj.name)
                     param_stats[param] = {
                         'mean': mean,
                         'map': map_samples[param_index],
-                        'lower_95': lower,
-                        'upper_95': upper,
-                        # 'lower_95': np.percentile(samples, 2.5),
-                        # 'upper_95': np.percentile(samples, 97.5)
+                        'lower_95': marge_stats.limits[1].lower,
+                        'upper_95': marge_stats.limits[1].upper,
                     }
             
             chain_stats.append(param_stats)
@@ -608,40 +691,15 @@ def create_projection_plot(
                     alpha=0.8
                 )
             
-            # Add reference value if available
             if param in markers:
-                ax.axvline(markers[param], color='black', linestyle='--', 
-                          linewidth=1, alpha=0.5, label='Planck' if i == 0 else None)
-            
-            # Formatting
+                ax.axvline(markers[param], color='black', linestyle='--', linewidth=1, alpha=0.5)
+
             ax.set_xlabel(param_label, fontsize=settings.axes_labelsize)
             ax.set_yticks(y_positions)
-            # Reverse the labels to match reversed y_positions
-            ax.set_yticklabels([chain.label for chain in chains], 
-                              fontsize=settings.axes_fontsize)
+            ax.set_yticklabels([chain.label for chain in chains],
+                               fontsize=settings.axes_fontsize)
             ax.tick_params(axis='x', labelsize=settings.axes_fontsize, rotation=45)
-            # ax.grid(True, alpha=0.3, axis='x')
             ax.set_ylim(-0.5, n_chains - 0.5)
-            
-            # Only show legend on first subplot
-            # if i == 0:
-            #     # Create custom legend
-            #     from matplotlib.lines import Line2D
-            #     legend_elements = [
-            #         Line2D([0], [0], marker='o', color='w', 
-            #               markerfacecolor='gray', markersize=8, 
-            #               label='Mean ± 95% CI'),
-            #         Line2D([0], [0], marker='D', color='w',
-            #               markerfacecolor='gray', markersize=6,
-            #               label='MAP')
-            #     ]
-            #     if any(param in markers for param in params):
-            #         legend_elements.append(
-            #             Line2D([0], [0], color='black', linestyle='--',
-            #                   linewidth=1, label='Planck')
-            #         )
-            #     ax.legend(handles=legend_elements, loc='best', 
-            #              fontsize=settings.axes_fontsize - 2)
         
         # Hide unused subplots
         for i in range(n_params, len(axes_flat)):
@@ -662,18 +720,18 @@ def create_projection_plot(
 def main():
     """Main execution function."""
     args = parse_arguments()
-    
-    # Validate chain labels
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
     if args.chain_labels and len(args.chain_labels) != len(args.chain_names):
         raise ValueError(
             f"Number of labels ({len(args.chain_labels)}) must match "
             f"number of chains ({len(args.chain_names)})"
         )
-    
-    # Use first chain name as savename if not specified
+
     savename = args.save_name if args.save_name else args.chain_names[0]
-    
-    # Setup configuration
+
     config = PlotConfig(
         chain_bases=args.chain_bases,
         chain_names=args.chain_names,
@@ -683,27 +741,37 @@ def main():
         params_to_plot=args.params,
         dpi=args.dpi,
         title=args.title,
-        projection_plot=args.projection
+        projection_plot=args.projection,
+        output_format=args.format,
     )
     
-    # Setup paths and settings
-    figpath = Path(args.output).expanduser().resolve()
-    figpath.mkdir(parents=True, exist_ok=True)
     plot_settings = configure_plot_settings(
         fontsize=config.axes_fontsize,
         labelsize=config.axes_labelsize
     )
     
-    # Chain loading settings
+    effective_rename: dict[str, str] = dict(RENAME_MAP)
+    if args.rename:
+        effective_rename.update(load_json_file(args.rename))
+
+    effective_latex: dict[str, str] = dict(LATEX_LABELS)
+    if args.latex_labels:
+        effective_latex.update(load_json_file(args.latex_labels))
+
+    if args.no_reference:
+        effective_reference: dict[str, float] = {}
+    else:
+        effective_reference = resolve_reference_renames(dict(PLANCK_PARAMS), effective_rename)
+        if args.reference:
+            loaded_ref: dict[str, float] = load_json_file(args.reference)
+            effective_reference.update(resolve_reference_renames(loaded_ref, effective_rename))
+
     chain_settings = {"ignore_rows": config.ignore_rows}
-    
-    # Load all chains
+
     chains = []
     for chain_name, chain_label in zip(config.chain_names, config.chain_labels):
         logger.info(f"Searching for chain: {chain_name}")
-        
         chain_path = find_chain_in_bases(config.chain_bases, chain_name)
-        
         if chain_path is None:
             error_msg = (
                 f"Chain '{chain_name}' not found in any of the base directories: "
@@ -711,18 +779,29 @@ def main():
             )
             logger.error(error_msg)
             raise FileNotFoundError(error_msg)
-        
         logger.info(f"  Found in: {chain_path.parent.name}")
-        
         chain = load_chain(chain_path, chain_name, chain_settings)
         chain.label = chain_label
+        logger.debug(f"  {chain.samples.shape[0]} samples, {len(chain.paramNames.names)} parameters")
         chains.append(chain)
-    
-    # Process all chains
+
+    renamed = [k for k in effective_rename if any(
+        p.name == k for c in chains for p in c.paramNames.names
+    )]
+    if renamed:
+        logger.debug(f"Renaming: {', '.join(f'{k} -> {effective_rename[k]}' for k in renamed)}")
+
     for chain in chains:
-        process_chain(chain, RENAME_MAP, LATEX_LABELS)
-    
-    # Validate parameters after processing
+        process_chain(chain, effective_rename, effective_latex)
+
+    if args.list_params:
+        available = chains[0].getParamNames().list()
+        print("\n".join(sorted(available)))
+        return
+
+    figpath = Path(args.output).expanduser().resolve()
+    figpath.mkdir(parents=True, exist_ok=True)
+
     if config.params_to_plot:
         try:
             validated_params = validate_parameters(chains, config.params_to_plot)
@@ -732,31 +811,30 @@ def main():
     else:
         validated_params = None
         logger.info("Plotting all available parameters")
-    
-    # Create and save plot
-    save_path = figpath / f"{config.savename}.png"
-    
+
+    save_path = figpath / f"{config.savename}.{config.output_format}"
+
     if config.projection_plot:
         create_projection_plot(
             chains=chains,
             params=validated_params,
-            markers=PLANCK_PARAMS,
+            markers=effective_reference,
             settings=plot_settings,
             save_path=save_path,
             dpi=config.dpi,
-            title=config.title
+            title=config.title,
         )
     else:
         create_triangle_plot(
             chains=chains,
             params=validated_params,
-            markers=PLANCK_PARAMS,
+            markers=effective_reference,
             settings=plot_settings,
             save_path=save_path,
             dpi=config.dpi,
             title=config.title
         )
-    
+
     plot_type = "projection" if config.projection_plot else "triangle"
     logger.info(f"{plot_type.capitalize()} plot saved to: {save_path}")
     logger.info(f"Plotted {len(chains)} chain(s)")
