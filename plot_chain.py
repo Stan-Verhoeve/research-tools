@@ -19,6 +19,26 @@ from typing import Final, override
 from collections.abc import Sequence
 from getdist import plots, MCSamples, loadMCSamples
 
+# getdist 1.7.x added ParamBounds.periodic, but both 1.4.x and 1.7.x share
+# pickle_version=22, so 1.7.x loads 1.4.x caches and finds objects where
+# periodic was never set. Patching __setstate__ injects it when missing.
+try:
+    from getdist.parampriors import ParamBounds as _ParamBounds
+    _orig_pb_setstate = getattr(_ParamBounds, '__setstate__', None)
+
+    def _pb_compat_setstate(self, state: dict) -> None:
+        if _orig_pb_setstate is not None:
+            _orig_pb_setstate(self, state)
+        else:
+            self.__dict__.update(state)
+        if 'periodic' not in self.__dict__:
+            self.__dict__['periodic'] = set()
+
+    _ParamBounds.__setstate__ = _pb_compat_setstate
+    del _ParamBounds, _orig_pb_setstate, _pb_compat_setstate
+except (ImportError, AttributeError):
+    pass
+
 
 # Setup logging with colored output
 class ColoredFormatter(logging.Formatter):
