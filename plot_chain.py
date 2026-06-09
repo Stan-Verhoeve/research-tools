@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Final, override
 from collections.abc import Sequence
 from getdist import plots, MCSamples, loadMCSamples
+from research_tools.style import configure_publication_style, PlotStyleDefaults
 
 # getdist 1.7.x added ParamBounds.periodic, but both 1.4.x and 1.7.x share
 # pickle_version=22, so 1.7.x loads 1.4.x caches and finds objects where
@@ -80,14 +81,11 @@ logger.propagate = False  # Prevent propagation to root logger
 
 # Constants
 @dataclass(frozen=True)
-class PlotDefaults:
-    """Default configuration values for plotting."""
+class PlotDefaults(PlotStyleDefaults):
+    """Default configuration values for plot_chain."""
     IGNORE_ROWS: str = "0.3"
-    DPI: int = 600
     CHAIN_BASE: str = "."
     PARAMS_TO_PLOT: tuple[str, ...] = ("logA", "ns", "H0", "ombh2", "omch2", "tau")
-    AXES_FONTSIZE: int = 16
-    AXES_LABELSIZE: int = 18
 
 
 DEFAULTS = PlotDefaults()
@@ -182,6 +180,8 @@ class PlotConfig:
     title: str | None = None
     projection_plot: bool = False
     output_format: str = "png"
+    colors: Sequence[str] | None = None
+    usetex: bool = False
 
     def __post_init__(self):
         if self.params_to_plot is None:
@@ -302,6 +302,19 @@ def parse_arguments() -> argparse.Namespace:
         help="Output figure format (default: png)"
     )
     parser.add_argument(
+        "--colors",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="COLOR",
+        help="Colors for each chain's contours (matplotlib color names or hex codes)"
+    )
+    parser.add_argument(
+        "--usetex",
+        action="store_true",
+        help="Use LaTeX for text rendering (requires a working LaTeX installation)"
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging"
@@ -312,23 +325,26 @@ def parse_arguments() -> argparse.Namespace:
 
 
 
+
 def configure_plot_settings(
     fontsize: int = DEFAULTS.AXES_FONTSIZE,
     labelsize: int = DEFAULTS.AXES_LABELSIZE
 ) -> plots.GetDistPlotSettings:
     """
     Create and configure plot settings.
-    
+
     Args:
         fontsize: Font size for axes
         labelsize: Font size for labels
-        
+
     Returns:
         Configured GetDistPlotSettings object
     """
     plot_settings = plots.GetDistPlotSettings()
     plot_settings.axes_fontsize = fontsize
     plot_settings.axes_labelsize = labelsize
+    plot_settings.legend_fontsize = DEFAULTS.LEGEND_FONTSIZE
+    plot_settings.lw_contour = DEFAULTS.LW_CONTOUR
     plot_settings.axis_tick_x_rotation = 45
     plot_settings.axis_tick_y_rotation = 45
     return plot_settings
@@ -549,11 +565,12 @@ def create_triangle_plot(
     settings: plots.GetDistPlotSettings,
     save_path: Path,
     dpi: int,
-    title: str | None = None
+    title: str | None = None,
+    colors: Sequence[str] | None = None,
 ) -> None:
     """
     Create and save triangle plot.
-    
+
     Args:
         chains: List of MCSamples to plot
         params: List of parameter names to include (or None for all)
@@ -562,10 +579,13 @@ def create_triangle_plot(
         save_path: Path where to save the figure
         dpi: Resolution for saved figure
         title: Optional title for the plot
+        colors: Optional list of colors for each chain's contours
     """
     try:
         g = plots.get_subplot_plotter(settings=settings)
-        g.triangle_plot(chains, params, filled=True, markers=markers)
+        contour_colors = list(colors[:len(chains)]) if colors else None
+        g.triangle_plot(chains, params, filled=True, markers=markers,
+                        contour_colors=contour_colors)
         
         # Add title if provided
         if title:
@@ -597,6 +617,7 @@ def create_projection_plot(
     save_path: Path,
     dpi: int,
     title: str | None = None,
+    colors: Sequence[str] | None = None,
 ) -> None:
     """
     Create and save a projection plot of parameter constraints.
@@ -609,12 +630,13 @@ def create_projection_plot(
         save_path: output path
         dpi: figure resolution
         title: optional figure title
+        colors: optional list of colors for each chain
     """
     try:
         # Get parameter list
         if params is None:
             params = chains[0].getParamNames().list()
-        
+
         # Get parameter labels
         param_labels = []
         for param in params:
@@ -623,26 +645,34 @@ def create_projection_plot(
                 param_labels.append(f"${p.label}$")
             else:
                 param_labels.append(param)
-        
+
         n_params = len(params)
         n_chains = len(chains)
-        
+
         # Calculate subplot layout: at most 3 columns
         n_cols = min(3, n_params)
         n_rows = int(np.ceil(n_params / n_cols))
-        
+
         # Create figure with subplots
         fig, axes = plt.subplots(
-            n_rows, n_cols, 
+            n_rows, n_cols,
             figsize=(4 * n_cols, max(3, n_chains * 0.6) * n_rows),
             squeeze=False
         )
-        
+
         # Flatten axes array for easier iteration
         axes_flat = axes.flatten()
-        
-        # Define colors for different statistics
-        colors = plt.cm.tab10(np.arange(n_chains))
+
+        # Resolve per-chain colors, falling back to tab10 for any unspecified chains
+        if colors:
+            import matplotlib.colors as mcolors
+            resolved_colors = [
+                mcolors.to_rgba(colors[i]) if i < len(colors)
+                else plt.cm.tab10(i)
+                for i in range(n_chains)
+            ]
+        else:
+            resolved_colors = [plt.cm.tab10(i) for i in range(n_chains)]
         
         # Precompute statistics for all chains
         chain_stats = []
@@ -692,7 +722,7 @@ def create_projection_plot(
                     mean, y_positions[j],
                     xerr=[[mean - lower], [upper - mean]],
                     fmt='o',
-                    color=colors[j],
+                    color=resolved_colors[j],
                     capsize=5,
                     capthick=2,
                     markersize=10,
@@ -705,7 +735,7 @@ def create_projection_plot(
                     map_value, y_positions[j],
                     marker='D',
                     markerfacecolor='none',
-                    markeredgecolor=colors[j],
+                    markeredgecolor=resolved_colors[j],
                     markeredgewidth=1.5,
                     markersize=6,
                     alpha=0.8
@@ -744,6 +774,8 @@ def main():
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
+    configure_publication_style(usetex=args.usetex)
+
     if args.chain_labels and len(args.chain_labels) != len(args.chain_names):
         raise ValueError(
             f"Number of labels ({len(args.chain_labels)}) must match "
@@ -763,6 +795,8 @@ def main():
         title=args.title,
         projection_plot=args.projection,
         output_format=args.format,
+        colors=args.colors,
+        usetex=args.usetex,
     )
     
     plot_settings = configure_plot_settings(
@@ -843,6 +877,7 @@ def main():
             save_path=save_path,
             dpi=config.dpi,
             title=config.title,
+            colors=config.colors,
         )
     else:
         create_triangle_plot(
@@ -852,7 +887,8 @@ def main():
             settings=plot_settings,
             save_path=save_path,
             dpi=config.dpi,
-            title=config.title
+            title=config.title,
+            colors=config.colors,
         )
 
     plot_type = "projection" if config.projection_plot else "triangle"

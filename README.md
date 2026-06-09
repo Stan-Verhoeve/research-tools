@@ -1,6 +1,32 @@
 # research-tools
 
-General-purpose scripts for research workflows.
+General-purpose scripts and shared utilities for research workflows.
+
+## `research_tools` package
+
+Importable Python package providing shared plotting utilities. Install into a Nix devshell via `buildPythonPackage` in your `flake.nix` (see below), then import from any script in that environment.
+
+```python
+from research_tools.style import configure_publication_style, PlotStyleDefaults, STYLE_DEFAULTS
+```
+
+### `research_tools.style`
+
+| Symbol | Description |
+|---|---|
+| `configure_publication_style(usetex=False)` | Apply publication-quality `rcParams` (serif fonts, inward ticks, consistent sizes). Pass `usetex=True` for LaTeX rendering. |
+| `PlotStyleDefaults` | Frozen dataclass with visual defaults: `DPI=600`, `AXES_FONTSIZE=14`, `AXES_LABELSIZE=16`, `LEGEND_FONTSIZE=13`, `LW_CONTOUR=1.5`. |
+| `STYLE_DEFAULTS` | Module-level instance of `PlotStyleDefaults`. |
+
+Script-specific overrides (different sizes, extra rcParams) can be applied via a follow-up `plt.rcParams.update({...})` after calling `configure_publication_style()`.
+
+### Installation
+
+```bash
+pip install -e .
+```
+
+---
 
 ## Contents
 
