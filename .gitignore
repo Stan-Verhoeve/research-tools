@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 .*.swp
 .DS_Store
+build/
+*.egg-info/
+dist/
