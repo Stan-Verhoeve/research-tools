@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import sys
+import warnings
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy import exp
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 from typing import Final, override
 from collections.abc import Sequence
 from getdist import plots, MCSamples, loadMCSamples
-from research_tools.style import configure_publication_style, PlotStyleDefaults
+from research_tools.style import configure_publication_style, PlotStyleDefaults, STYLE_DEFAULTS
 
 # getdist 1.7.x added ParamBounds.periodic, but both 1.4.x and 1.7.x share
 # pickle_version=22, so 1.7.x loads 1.4.x caches and finds objects where
@@ -104,13 +105,13 @@ LATEX_LABELS: Final[dict[str, str]] = {
 }
 
 PLANCK_PARAMS: Final[dict[str, float]] = {
-    "logA": 3.044,
-    "As": exp(3.044) * 1e-10,
-    "ns": 0.966,
-    "H0": 67.4,
-    "ombh2": 0.0224,
-    "omch2": 0.120,
-    "tau": 0.054,
+    "logA": 3.040,
+    "As": exp(3.040) * 1e-10,
+    "ns": 0.9681,
+    "H0": 67.64,
+    "ombh2": 0.02226,
+    "omch2": 0.1188,
+    "tau": 0.0580,
     "alphaB_BS": 0.0,
     "RPHalphaM0": 0.0,
     "RPHbraiding0": 0.0,
@@ -179,9 +180,11 @@ class PlotConfig:
     axes_labelsize: int = DEFAULTS.AXES_LABELSIZE
     title: str | None = None
     projection_plot: bool = False
+    projection2d: bool = False
     output_format: str = "png"
     colors: Sequence[str] | None = None
     usetex: bool = False
+    no_legend: bool = False
 
     def __post_init__(self):
         if self.params_to_plot is None:
@@ -261,7 +264,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--projection",
         action="store_true",
-        help="Create projection plot instead of triangle plot"
+        help="Create 2D triangle plot with MAP diamonds overlaid"
+    )
+    parser.add_argument(
+        "--projection1d",
+        action="store_true",
+        help="Create 1D projection plot with error bars (original projection mode)"
     )
     parser.add_argument(
         "--rename",
@@ -310,9 +318,21 @@ def parse_arguments() -> argparse.Namespace:
         help="Colors for each chain's contours (matplotlib color names or hex codes)"
     )
     parser.add_argument(
+        "--no-legend",
+        action="store_true",
+        help="Suppress the legend in the plot"
+    )
+    parser.add_argument(
         "--usetex",
         action="store_true",
         help="Use LaTeX for text rendering (requires a working LaTeX installation)"
+    )
+    parser.add_argument(
+        "--plot-settings",
+        type=str,
+        default=None,
+        metavar="JSON",
+        help='JSON string of GetDistPlotSettings overrides, e.g. \'{"fig_width_inch": 3.04}\''
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -341,10 +361,12 @@ def configure_plot_settings(
         Configured GetDistPlotSettings object
     """
     plot_settings = plots.GetDistPlotSettings()
+    plot_settings.scaling = False
     plot_settings.axes_fontsize = fontsize
     plot_settings.axes_labelsize = labelsize
     plot_settings.legend_fontsize = DEFAULTS.LEGEND_FONTSIZE
     plot_settings.lw_contour = DEFAULTS.LW_CONTOUR
+    plot_settings.fig_width_inch = DEFAULTS.FIGWIDTH
     plot_settings.axis_tick_x_rotation = 45
     plot_settings.axis_tick_y_rotation = 45
     return plot_settings
@@ -487,6 +509,39 @@ def process_chain(
     update_latex_labels(chain, latex_labels)
 
 
+def load_map_from_bestfit(
+    chain: MCSamples,
+    rename_map: dict[str, str],
+    max_posterior: bool = True,
+) -> dict[str, float] | None:
+    """
+    Load MAP values from the chain's .minimum (or .bestfit) file via getdist.
+
+    getdist writes pre-rename Cobaya parameter names into the file, so the
+    rename map is applied to the returned keys. Python-side derived params
+    (e.g. alphaB_BS added by our script) are absent from the file; callers
+    should fall back per-parameter for those.
+
+    Args:
+        chain: MCSamples object (must have chain.root set, i.e. loaded from file).
+        rename_map: The effective rename map used when processing the chain.
+        max_posterior: True to load .minimum (MAP), False for .bestfit (MLE).
+
+    Returns:
+        Dict mapping renamed param names to MAP values, or None if unavailable.
+    """
+    try:
+        raw = chain.getBestFit(max_posterior=max_posterior).getParamDict(include_derived=True)
+        result = {rename_map.get(k, k): v for k, v in raw.items()
+                  if k not in ('weight', 'loglike')}
+        ext = '.minimum' if max_posterior else '.bestfit'
+        logger.debug(f"  Loaded MAP from {ext} ({len(result)} params)")
+        return result
+    except Exception as exc:
+        logger.debug(f"  No bestfit file or failed to load: {exc}")
+        return None
+
+
 def build_parameter_suggestions(
     missing_params: Sequence[str],
     available_params: set[str]
@@ -567,6 +622,7 @@ def create_triangle_plot(
     dpi: int,
     title: str | None = None,
     colors: Sequence[str] | None = None,
+    no_legend: bool = False,
 ) -> None:
     """
     Create and save triangle plot.
@@ -580,12 +636,14 @@ def create_triangle_plot(
         dpi: Resolution for saved figure
         title: Optional title for the plot
         colors: Optional list of colors for each chain's contours
+        no_legend: Suppress the legend
     """
     try:
         g = plots.get_subplot_plotter(settings=settings)
         contour_colors = list(colors[:len(chains)]) if colors else None
         g.triangle_plot(chains, params, filled=True, markers=markers,
-                        contour_colors=contour_colors)
+                        contour_colors=contour_colors,
+                        legend_labels=[] if no_legend else None)
         
         # Add title if provided
         if title:
@@ -618,6 +676,7 @@ def create_projection_plot(
     dpi: int,
     title: str | None = None,
     colors: Sequence[str] | None = None,
+    chain_maps: Sequence[dict[str, float] | None] | None = None,
 ) -> None:
     """
     Create and save a projection plot of parameter constraints.
@@ -631,6 +690,8 @@ def create_projection_plot(
         dpi: figure resolution
         title: optional figure title
         colors: optional list of colors for each chain
+        chain_maps: per-chain MAP dicts from .minimum files; falls back to
+            best sample when None or when a parameter is absent
     """
     try:
         # Get parameter list
@@ -649,15 +710,18 @@ def create_projection_plot(
         n_params = len(params)
         n_chains = len(chains)
 
-        # Calculate subplot layout: at most 3 columns
-        n_cols = min(3, n_params)
+        # Calculate subplot layout: at most 2 columns
+        n_cols = min(2, n_params)
         n_rows = int(np.ceil(n_params / n_cols))
 
         # Create figure with subplots
+        panel_h = n_chains * 0.45 + 0.5
         fig, axes = plt.subplots(
             n_rows, n_cols,
-            figsize=(4 * n_cols, max(3, n_chains * 0.6) * n_rows),
-            squeeze=False
+            figsize=(STYLE_DEFAULTS.FIGWIDTH, panel_h * n_rows),
+            squeeze=False,
+            constrained_layout=True,
+            sharey=True,
         )
 
         # Flatten axes array for easier iteration
@@ -676,12 +740,12 @@ def create_projection_plot(
         
         # Precompute statistics for all chains
         chain_stats = []
-        for chain in chains:
-            # Get MAP (Maximum A Posteriori) - sample with highest likelihood
+        for i, chain in enumerate(chains):
+            file_map = chain_maps[i] if chain_maps is not None else None
+            # Fallback: best sample by likelihood (used when file MAP is absent)
             map_index = np.argmin(chain.loglikes)
             map_samples = chain.samples[map_index]
-            
-            # Get statistics for each parameter
+
             param_stats = {}
             for param in params:
                 param_obj = chain.paramNames.parWithName(param)
@@ -690,13 +754,18 @@ def create_projection_plot(
                     samples = chain.samples[:, param_index]
                     mean = np.average(samples, weights=chain.weights)
                     marge_stats = chain.getMargeStats().parWithName(param_obj.name)
+                    map_val = (
+                        file_map[param]
+                        if file_map is not None and param in file_map
+                        else map_samples[param_index]
+                    )
                     param_stats[param] = {
                         'mean': mean,
-                        'map': map_samples[param_index],
+                        'map': map_val,
                         'lower_95': marge_stats.limits[1].lower,
                         'upper_95': marge_stats.limits[1].upper,
                     }
-            
+
             chain_stats.append(param_stats)
         
         # For each parameter, create a subplot
@@ -723,22 +792,23 @@ def create_projection_plot(
                     xerr=[[mean - lower], [upper - mean]],
                     fmt='o',
                     color=resolved_colors[j],
-                    capsize=5,
-                    capthick=2,
-                    markersize=10,
+                    capsize=3,
+                    capthick=0.8,
+                    lw=STYLE_DEFAULTS.LW_CONTOUR,
+                    markersize=5,
                     label=chain.label if i == 0 else None,
-                    alpha=0.5
+                    alpha=0.8
                 )
-                
+
                 # Plot MAP as a diamond marker
                 ax.plot(
                     map_value, y_positions[j],
                     marker='D',
                     markerfacecolor='none',
                     markeredgecolor=resolved_colors[j],
-                    markeredgewidth=1.5,
-                    markersize=6,
-                    alpha=0.8
+                    markeredgewidth=1.0,
+                    markersize=4,
+                    alpha=0.9
                 )
             
             if param in markers:
@@ -755,16 +825,89 @@ def create_projection_plot(
         for i in range(n_params, len(axes_flat)):
             axes_flat[i].axis('off')
         
-        # Add overall title if provided
         if title:
-            fig.suptitle(title, fontsize=settings.axes_labelsize + 2, y=0.98)
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
-        else:
-            plt.tight_layout()
+            fig.suptitle(title, fontsize=settings.axes_labelsize + 2)
         
         plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
     finally:
         plt.close("all")
+
+
+def _contrasting_edge(color: str) -> str:
+    """Return 'white' or 'black' depending on the luminance of color."""
+    import matplotlib.colors as mcolors
+    r, g, b, _ = mcolors.to_rgba(color)
+    return 'white' if (0.299 * r + 0.587 * g + 0.114 * b) < 0.5 else 'black'
+
+
+def create_projection2d_plot(
+    chains: Sequence[MCSamples],
+    params: Sequence[str] | None,
+    markers: dict[str, float],
+    settings: plots.GetDistPlotSettings,
+    save_path: Path,
+    dpi: int,
+    title: str | None = None,
+    colors: Sequence[str] | None = None,
+    chain_maps: Sequence[dict[str, float] | None] | None = None,
+    no_legend: bool = False,
+) -> None:
+    """
+    Triangle plot with filled MAP diamonds overlaid on every 2D panel.
+
+    Args:
+        chains: chains to plot
+        params: parameters to include (None for all)
+        markers: reference marker values for 1D diagonal panels
+        settings: GetDist plot settings (fig_width_inch already set)
+        save_path: output path
+        dpi: figure resolution
+        title: optional figure title
+        colors: contour colors for each chain; defaults to tab10 if not given
+        chain_maps: per-chain MAP dicts from .minimum files
+    """
+    if params is None:
+        params = list(chains[0].getParamNames().list())
+
+    n_chains = len(chains)
+    resolved_colors: list[str] = (
+        [str(colors[i]) for i in range(min(len(colors), n_chains))]
+        if colors
+        else [f"C{i}" for i in range(n_chains)]
+    )
+
+    try:
+        g = plots.get_subplot_plotter(settings=settings)
+        g.triangle_plot(chains, params, filled=True, markers=markers,
+                        contour_colors=resolved_colors,
+                        legend_labels=[] if no_legend else None)
+
+        if chain_maps is not None:
+            n_params = len(params)
+            for i in range(1, n_params):
+                for j in range(i):
+                    ax = g.subplots[i, j]
+                    if ax is None:
+                        continue
+                    for color, cmap in zip(resolved_colors, chain_maps):
+                        if cmap is None:
+                            continue
+                        col_p, row_p = params[j], params[i]
+                        if col_p in cmap and row_p in cmap:
+                            ax.plot(
+                                cmap[col_p], cmap[row_p],
+                                marker='D', ms=3, zorder=5,
+                                mfc=color,
+                                mec=_contrasting_edge(color),
+                                mew=0.5, ls='none',
+                            )
+
+        if title:
+            plt.gcf().suptitle(title, fontsize=settings.axes_labelsize + 2, y=1.01)
+
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    finally:
+        plt.close('all')
 
 
 def main():
@@ -793,17 +936,26 @@ def main():
         params_to_plot=args.params,
         dpi=args.dpi,
         title=args.title,
-        projection_plot=args.projection,
+        projection_plot=args.projection1d,
+        projection2d=args.projection,
         output_format=args.format,
         colors=args.colors,
         usetex=args.usetex,
+        no_legend=args.no_legend,
     )
     
     plot_settings = configure_plot_settings(
         fontsize=config.axes_fontsize,
         labelsize=config.axes_labelsize
     )
-    
+
+    if args.plot_settings:
+        for key, val in json.loads(args.plot_settings).items():
+            if not hasattr(plot_settings, key):
+                warnings.warn(f"--plot-settings: unknown key '{key}', ignored")
+            else:
+                setattr(plot_settings, key, val)
+
     effective_rename: dict[str, str] = dict(RENAME_MAP)
     if args.rename:
         effective_rename.update(load_json_file(args.rename))
@@ -848,6 +1000,10 @@ def main():
     for chain in chains:
         process_chain(chain, effective_rename, effective_latex)
 
+    chain_maps = [load_map_from_bestfit(chain, effective_rename) for chain in chains]
+    if any(m is not None for m in chain_maps):
+        logger.debug("Using MAP from .minimum file(s) for projection plot")
+
     if args.list_params:
         available = chains[0].getParamNames().list()
         print("\n".join(sorted(available)))
@@ -868,7 +1024,21 @@ def main():
 
     save_path = figpath / f"{config.savename}.{config.output_format}"
 
-    if config.projection_plot:
+    if config.projection2d:
+        create_projection2d_plot(
+            chains=chains,
+            params=validated_params,
+            markers=effective_reference,
+            settings=plot_settings,
+            save_path=save_path,
+            dpi=config.dpi,
+            title=config.title,
+            colors=config.colors,
+            chain_maps=chain_maps,
+            no_legend=config.no_legend,
+        )
+        plot_type = "projection2d"
+    elif config.projection_plot:
         create_projection_plot(
             chains=chains,
             params=validated_params,
@@ -878,7 +1048,9 @@ def main():
             dpi=config.dpi,
             title=config.title,
             colors=config.colors,
+            chain_maps=chain_maps,
         )
+        plot_type = "projection1d"
     else:
         create_triangle_plot(
             chains=chains,
@@ -889,9 +1061,9 @@ def main():
             dpi=config.dpi,
             title=config.title,
             colors=config.colors,
+            no_legend=config.no_legend,
         )
-
-    plot_type = "projection" if config.projection_plot else "triangle"
+        plot_type = "triangle"
     logger.info(f"{plot_type.capitalize()} plot saved to: {save_path}")
     logger.info(f"Plotted {len(chains)} chain(s)")
 

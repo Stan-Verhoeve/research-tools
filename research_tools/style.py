@@ -7,10 +7,12 @@ from typing import Final
 class PlotStyleDefaults:
     """Visual defaults shared across publication-style plots."""
     DPI: int = 600
-    AXES_FONTSIZE: int = 14
-    AXES_LABELSIZE: int = 16
-    LEGEND_FONTSIZE: int = 13
+    AXES_FONTSIZE: int = 10
+    AXES_LABELSIZE: int = 12
+    LEGEND_FONTSIZE: int = 10
     LW_CONTOUR: float = 1.5
+    FIGWIDTH: float = 6.08948     # LaTeX \linewidth in inches
+    FIGSIZE_SINGLE: tuple = (6.08948, 4.2)
 
 
 STYLE_DEFAULTS: Final = PlotStyleDefaults()
@@ -41,5 +43,6 @@ def configure_publication_style(usetex: bool = False) -> None:
         'legend.framealpha': 0.8,
         'legend.edgecolor': '0.8',
         'figure.dpi': 100,
+        'figure.figsize': STYLE_DEFAULTS.FIGSIZE_SINGLE,
         'savefig.dpi': STYLE_DEFAULTS.DPI,
     })
